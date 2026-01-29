@@ -25,12 +25,19 @@ const int LED_VERTE  = 25;
 const int LED_YELLOW = 33;
 const int LED_ROUGE  = 27;
 const int BOUTON     = 14;
+const int BUZZER     = 26;
 
 bool green = false;
 bool yellow = false;
 bool red = false;
 
 bool ambulanceState = false;
+bool sirenActive = false;
+unsigned long lastToneChange = 0;
+bool toneHigh = false;
+const int TONE_HIGH = 800;
+const int TONE_LOW = 400;
+const int TONE_DURATION = 300; 
 
 void connectWiFi() {
   Serial.println("\n[WIFI] Démarrage...");
@@ -160,6 +167,28 @@ void connectMQTT() {
   Serial.println("[MQTT] ✗ ABANDON après 5 tentatives");
 }
 
+void updateSiren() {
+  if (!sirenActive) {
+    noTone(BUZZER);
+    return;
+  }
+  
+  // Sirène avec balayage de fréquence
+  static int currentFreq = TONE_LOW;
+  static int direction = 10;
+  
+  unsigned long now = millis();
+  if (now - lastToneChange >= 20) {  // Mise à jour toutes les 20ms
+    lastToneChange = now;
+    
+    currentFreq += direction;
+    if (currentFreq >= TONE_HIGH) direction = -10;
+    if (currentFreq <= TONE_LOW) direction = 10;
+    
+    tone(BUZZER, currentFreq);
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -171,14 +200,18 @@ void setup() {
   pinMode(LED_YELLOW, OUTPUT);
   pinMode(LED_VERTE, OUTPUT);
 
+  pinMode(BUZZER, OUTPUT);
+
   pinMode(BOUTON, INPUT_PULLUP);
 }
 
 
 void publishAmbulance(bool ambulanceStatus) {
-  float tempC = 22.4f + (float)random(-15,16) / 10.0f;
-  float humPct = 42.67f + (float)random(-30,31) / 10.0f;
-  int batteryPct = 100;
+
+  sirenActive = ambulanceStatus;
+  if (!sirenActive) {
+    noTone(BUZZER);
+  }
 
   StaticJsonDocument<256> doc;
   JsonObject t = doc.to<JsonObject>();
@@ -203,6 +236,8 @@ void loop() {
   }
 
   mqtt.loop();
+
+  updateSiren();
 
   digitalWrite(LED_ROUGE, red);
   digitalWrite(LED_YELLOW, yellow);
