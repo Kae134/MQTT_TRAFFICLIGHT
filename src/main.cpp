@@ -3,10 +3,10 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 
-#define WIFI_SSID ""
-#define WIFI_PASS ""
+#define WIFI_SSID "iCellulaire"
+#define WIFI_PASS "mBi540816"
 
-#define MQTT_HOST ""
+#define MQTT_HOST "172.20.10.11"
 #define MQTT_PORT 1883
 
 #define MQTT_TOPIC "trafic/status"
@@ -14,7 +14,7 @@
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
 
-const char* DEVICE_ID = "trafic-01";
+const char* DEVICE_ID = "trafic-02";
 uint32_t seq = 42;
 const uint32_t baseTs = 1767828437;
 const uint32_t publishIntervalMs = 5000;
@@ -22,12 +22,12 @@ unsigned long lastPublishMs = 0;
 
 
 const int LED_VERTE  = 25;
-const int LED_ORANGE = 33;
+const int LED_YELLOW = 33;
 const int LED_ROUGE  = 27;
 const int BOUTON     = 14;
 
 bool green = false;
-bool orange = false;
+bool yellow = false;
 bool red = false;
 
 bool ambulanceState = false;
@@ -94,9 +94,11 @@ void mqttCallBack(char* topic, byte* payload, unsigned int lenght) {
 
   StaticJsonDocument<256> doc;
   deserializeJson(doc, message);
-  green = doc["green"];
-  orange = doc["yellow"];
-  red = doc["red"];
+  if (DEVICE_ID == doc["deviceId"]) {
+    green = doc["green"];
+    yellow = doc["yellow"];
+    red = doc["red"];
+  }
 }
 
 void connectMQTT() {
@@ -166,7 +168,7 @@ void setup() {
   connectMQTT();
 
   pinMode(LED_ROUGE, OUTPUT);
-  pinMode(LED_ORANGE, OUTPUT);
+  pinMode(LED_YELLOW, OUTPUT);
   pinMode(LED_VERTE, OUTPUT);
 
   pinMode(BOUTON, INPUT_PULLUP);
@@ -203,7 +205,7 @@ void loop() {
   mqtt.loop();
 
   digitalWrite(LED_ROUGE, red);
-  digitalWrite(LED_ORANGE, orange);
+  digitalWrite(LED_YELLOW, yellow);
   digitalWrite(LED_VERTE, green);
 
   unsigned long now = millis();
