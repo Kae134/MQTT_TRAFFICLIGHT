@@ -6,250 +6,292 @@
 #define WIFI_SSID "iCellulaire"
 #define WIFI_PASS "mBi540816"
 
-#define MQTT_HOST "172.20.10.11"
-#define MQTT_PORT 1883
+#define MQTT_HOST "captain.dev0.pandor.cloud"
+#define MQTT_PORT 1884
+#define MQTT_TOPIC "tug/teamB/Kaktus"
 
-#define MQTT_TOPIC "trafic/status"
+#define BUTTON_TEST 14
 
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
 
-const char* DEVICE_ID = "trafic-02";
+const char* DEVICE_ID = "esp32-div";
 uint32_t seq = 42;
-const uint32_t baseTs = 1767828437;
-const uint32_t publishIntervalMs = 5000;
-unsigned long lastPublishMs = 0;
 
+bool lastButtonState = HIGH;
 
-const int LED_VERTE  = 25;
-const int LED_YELLOW = 33;
-const int LED_ROUGE  = 27;
-const int BOUTON     = 14;
-const int BUZZER     = 26;
+// Stats pour analyser le rate limit
+struct RateLimitStats {
+  uint32_t totalSent = 0;
+  uint32_t totalSuccess = 0;
+  uint32_t totalFailed = 0;
+  unsigned long startTime = 0;
+  unsigned long endTime = 0;
+  uint32_t messagesPerSecond = 0;
+};
 
-bool green = false;
-bool yellow = false;
-bool red = false;
-
-bool ambulanceState = false;
-bool sirenActive = false;
-unsigned long lastToneChange = 0;
-bool toneHigh = false;
-const int TONE_HIGH = 800;
-const int TONE_LOW = 400;
-const int TONE_DURATION = 300; 
+RateLimitStats stats;
 
 void connectWiFi() {
-  Serial.println("\n[WIFI] Démarrage...");
-  Serial.print("SSID: ");
-  Serial.println(WIFI_SSID);
+  if(WiFi.status() == WL_CONNECTED) return;
   
+  Serial.println("\n[WIFI] Connexion...");
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(100);
-  
-  Serial.println("[WIFI] Scan des réseaux disponibles...");
-  int n = WiFi.scanNetworks();
-  for(int i = 0; i < n; i++) {
-    Serial.print("  ");
-    Serial.print(i+1);
-    Serial.print(": ");
-    Serial.print(WiFi.SSID(i));
-    Serial.print(" (");
-    Serial.print(WiFi.RSSI(i));
-    Serial.print(" dBm) ");
-    Serial.println(WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "OPEN" : "SECURED");
-  }
-  
-  Serial.print("[WIFI] Tentative de connexion à ");
-  Serial.println(WIFI_SSID);
-  
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   
-  int timeout = 30; // 30 secondes
+  int timeout = 30;
   while(WiFi.status() != WL_CONNECTED && timeout > 0) {
-    delay(1000);
+    delay(500);
     Serial.print(".");
-    Serial.print(WiFi.status()); // Affiche le code d'état
     timeout--;
   }
   
   if(WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n[WIFI] ✓ Connecté !");
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("Signal: ");
-    Serial.print(WiFi.RSSI());
-    Serial.println(" dBm");
-  } else {
-    Serial.println("\n[WIFI] ✗ ÉCHEC de connexion");
-    Serial.print("Statut WiFi: ");
-    Serial.println(WiFi.status());
-  }
-}
-
-void mqttCallBack(char* topic, byte* payload, unsigned int lenght) {
-  Serial.print("[MQTT] Message recu sur le topic : ");
-  Serial.println(topic);
-
-  char message[lenght + 1];
-  memcpy(message, payload, lenght);
-  message[lenght] = '\0';
-
-  Serial.print("[MQTT] Payload :");
-  Serial.println(message);
-
-  StaticJsonDocument<256> doc;
-  deserializeJson(doc, message);
-  if (DEVICE_ID == doc["deviceId"]) {
-    green = doc["green"];
-    yellow = doc["yellow"];
-    red = doc["red"];
+    Serial.println("\n[WIFI] ✓ OK - IP: " + WiFi.localIP().toString());
   }
 }
 
 void connectMQTT() {
+  if(mqtt.connected()) return;
+  
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setKeepAlive(60);
-  mqtt.setSocketTimeout(30);
-
-  mqtt.setCallback(mqttCallBack);
+  mqtt.setSocketTimeout(15);
   
-  Serial.println("\n[MQTT] Configuration:");
-  Serial.print("  Host: ");
-  Serial.println(MQTT_HOST);
-  Serial.print("  Port: ");
-  Serial.println(MQTT_PORT);
+  Serial.println("[MQTT] Connexion...");
+  String clientId = "esp32-" + String((uint32_t)ESP.getEfuseMac(), HEX);
   
-  int retries = 0;
-  while(!mqtt.connected() && retries < 5) {
-    String clientId = String("esp32-") + String((uint32_t)ESP.getEfuseMac(), HEX);
-    Serial.print("[MQTT] Tentative ");
-    Serial.print(retries + 1);
-    Serial.print(" - ClientID: ");
-    Serial.println(clientId);
-    
-    bool ok = mqtt.connect(clientId.c_str());
-    
-    if(ok) {
-      Serial.println("[MQTT] ✓ Connecté !");
-
-      mqtt.subscribe("trafic/cmd");
-      Serial.println("[MQTT] Abonné au topic !");
+  for(int i = 0; i < 3; i++) {
+    if(mqtt.connect(clientId.c_str())) {
+      Serial.println("[MQTT] ✓ Connecté");
       return;
+    }
+    delay(1000);
+  }
+}
+
+bool sendMessage() {
+  StaticJsonDocument<256> doc;
+  doc["device_id"] = DEVICE_ID;
+  doc["seq"] = seq++;
+  doc["timestamp"] = millis();
+  
+  char payload[256];
+  size_t n = serializeJson(doc, payload, sizeof(payload));
+  
+  return mqtt.publish(MQTT_TOPIC, payload, n);
+}
+
+void testRateLimit(uint32_t totalMessages, uint32_t delayMs) {
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("║     TEST DE RATE LIMIT                 ║");
+  Serial.println("╚════════════════════════════════════════╝");
+  Serial.print("Messages à envoyer : ");
+  Serial.println(totalMessages);
+  Serial.print("Délai entre messages : ");
+  Serial.print(delayMs);
+  Serial.println("ms");
+  Serial.println("────────────────────────────────────────");
+  
+  // Reset stats
+  stats.totalSent = 0;
+  stats.totalSuccess = 0;
+  stats.totalFailed = 0;
+  stats.startTime = millis();
+  
+  uint32_t successStreak = 0;
+  uint32_t failStreak = 0;
+  uint32_t maxSuccessStreak = 0;
+  uint32_t firstFailAt = 0;
+  
+  for(uint32_t i = 0; i < totalMessages; i++) {
+    stats.totalSent++;
+    
+    bool success = sendMessage();
+    
+    if(success) {
+      stats.totalSuccess++;
+      successStreak++;
+      failStreak = 0;
+      Serial.print("✓");
+      
+      if(successStreak > maxSuccessStreak) {
+        maxSuccessStreak = successStreak;
+      }
     } else {
-      int state = mqtt.state();
-      Serial.print("[MQTT] ✗ Échec, code: ");
-      Serial.print(state);
-      Serial.print(" = ");
+      stats.totalFailed++;
+      failStreak++;
+      successStreak = 0;
+      Serial.print("✗");
       
-      switch(state) {
-        case -4: Serial.println("MQTT_CONNECTION_TIMEOUT"); break;
-        case -3: Serial.println("MQTT_CONNECTION_LOST"); break;
-        case -2: Serial.println("MQTT_CONNECT_FAILED"); break;
-        case -1: Serial.println("MQTT_DISCONNECTED"); break;
-        case  1: Serial.println("MQTT_CONNECT_BAD_PROTOCOL"); break;
-        case  2: Serial.println("MQTT_CONNECT_BAD_CLIENT_ID"); break;
-        case  3: Serial.println("MQTT_CONNECT_UNAVAILABLE"); break;
-        case  4: Serial.println("MQTT_CONNECT_BAD_CREDENTIALS"); break;
-        case  5: Serial.println("MQTT_CONNECT_UNAUTHORIZED"); break;
-        default: Serial.println("UNKNOWN"); break;
+      if(firstFailAt == 0) {
+        firstFailAt = i + 1;
       }
+    }
+    
+    // Affichage tous les 10 messages
+    if((i + 1) % 10 == 0) {
+      Serial.print(" [");
+      Serial.print(i + 1);
+      Serial.print("/");
+      Serial.print(totalMessages);
+      Serial.print("] ");
       
-      retries++;
-      if(retries < 5) {
-        Serial.println("  Nouvelle tentative dans 3s...");
-        delay(3000);
-      }
+      // Taux de succès actuel
+      float successRate = (float)stats.totalSuccess / stats.totalSent * 100.0;
+      Serial.print(successRate, 1);
+      Serial.println("%");
+    }
+    
+    // mqtt.loop tous les 5 messages
+    if(i % 5 == 0) {
+      mqtt.loop();
+    }
+    
+    if(delayMs > 0) {
+      delay(delayMs);
     }
   }
   
-  Serial.println("[MQTT] ✗ ABANDON après 5 tentatives");
+  stats.endTime = millis();
+  mqtt.loop(); // Final loop
+  
+  // Calcul des statistiques
+  unsigned long duration = stats.endTime - stats.startTime;
+  float durationSec = duration / 1000.0;
+  stats.messagesPerSecond = (uint32_t)(stats.totalSuccess / durationSec);
+  
+  // Affichage des résultats
+  Serial.println("\n");
+  Serial.println("╔════════════════════════════════════════╗");
+  Serial.println("║          RÉSULTATS                     ║");
+  Serial.println("╚════════════════════════════════════════╝");
+  
+  Serial.print("Messages envoyés    : ");
+  Serial.println(stats.totalSent);
+  
+  Serial.print("✓ Succès            : ");
+  Serial.print(stats.totalSuccess);
+  Serial.print(" (");
+  Serial.print((float)stats.totalSuccess / stats.totalSent * 100.0, 1);
+  Serial.println("%)");
+  
+  Serial.print("✗ Échecs            : ");
+  Serial.print(stats.totalFailed);
+  Serial.print(" (");
+  Serial.print((float)stats.totalFailed / stats.totalSent * 100.0, 1);
+  Serial.println("%)");
+  
+  Serial.println("────────────────────────────────────────");
+  
+  Serial.print("Durée totale        : ");
+  Serial.print(durationSec, 2);
+  Serial.println(" secondes");
+  
+  Serial.print("Débit réel          : ");
+  Serial.print(stats.messagesPerSecond);
+  Serial.println(" msg/sec");
+  
+  Serial.println("────────────────────────────────────────");
+  
+  if(firstFailAt > 0) {
+    Serial.print("Premier échec au    : message #");
+    Serial.println(firstFailAt);
+  } else {
+    Serial.println("Premier échec au    : AUCUN !");
+  }
+  
+  Serial.print("Plus longue série ✓ : ");
+  Serial.print(maxSuccessStreak);
+  Serial.println(" messages");
+  
+  Serial.println("════════════════════════════════════════\n");
 }
 
-void updateSiren() {
-  if (!sirenActive) {
-    noTone(BUZZER);
-    return;
+void testMultipleScenarios() {
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("║   TESTS MULTIPLES SCENARIOS            ║");
+  Serial.println("╚════════════════════════════════════════╝\n");
+  
+  // Test 1 : Burst rapide
+  Serial.println("📊 TEST 1 : Burst rapide (100 msg, 0ms délai)");
+  testRateLimit(10, 0);
+  delay(2000);
+  
+  // Test 2 : Envoi modéré
+  Serial.println("📊 TEST 2 : Envoi modéré (50 msg, 50ms délai)");
+  testRateLimit(50, 50);
+  delay(2000);
+  
+  // Test 3 : Envoi lent
+  Serial.println("📊 TEST 3 : Envoi lent (30 msg, 100ms délai)");
+  testRateLimit(30, 100);
+  delay(2000);
+  
+  // Test 4 : Long burst
+  Serial.println("📊 TEST 4 : Long burst (200 msg, 0ms délai)");
+  testRateLimit(50, 0);
+  
+  Serial.println("\n✅ TOUS LES TESTS TERMINÉS !\n");
+}
+
+void handleButton() {
+  int reading = digitalRead(BUTTON_TEST);
+  
+  if(reading == LOW && lastButtonState == HIGH) {
+    testMultipleScenarios();
+    delay(300);
   }
   
-  // Sirène avec balayage de fréquence
-  static int currentFreq = TONE_LOW;
-  static int direction = 10;
-  
-  unsigned long now = millis();
-  if (now - lastToneChange >= 20) {  // Mise à jour toutes les 20ms
-    lastToneChange = now;
-    
-    currentFreq += direction;
-    if (currentFreq >= TONE_HIGH) direction = -10;
-    if (currentFreq <= TONE_LOW) direction = 10;
-    
-    tone(BUZZER, currentFreq);
-  }
+  lastButtonState = reading;
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-
+  delay(500);
+  
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("║   RATE LIMIT TESTER v1.0               ║");
+  Serial.println("╚════════════════════════════════════════╝");
+  
+  pinMode(BUTTON_TEST, INPUT_PULLUP);
+  
   connectWiFi();
   connectMQTT();
-
-  pinMode(LED_ROUGE, OUTPUT);
-  pinMode(LED_YELLOW, OUTPUT);
-  pinMode(LED_VERTE, OUTPUT);
-
-  pinMode(BUZZER, OUTPUT);
-
-  pinMode(BOUTON, INPUT_PULLUP);
-}
-
-
-void publishAmbulance(bool ambulanceStatus) {
-
-  sirenActive = ambulanceStatus;
-  if (!sirenActive) {
-    noTone(BUZZER);
-  }
-
-  StaticJsonDocument<256> doc;
-  JsonObject t = doc.to<JsonObject>();
-  t["deviceId"] = DEVICE_ID;
-  t["ambulance"] = ambulanceStatus;
-  char payload[256];
-  size_t n = serializeJson(doc, payload, sizeof(payload));
-
-  bool ok = mqtt.publish(MQTT_TOPIC, payload, n);
-  Serial.print("[MQTT] Publish to ");
-  Serial.print(MQTT_TOPIC);
-  Serial.print(" ... ");
-  Serial.println(ok ? payload : "FAILED");
+  
+  Serial.println("\n✅ PRÊT - Appuyez sur le bouton pour tester\n");
+  Serial.println("Ou envoyez 't' via Serial Monitor\n");
 }
 
 void loop() {
-  if(WiFi.status() != WL_CONNECTED) {
-    connectWiFi();
+  static unsigned long lastWifiCheck = 0;
+  if(millis() - lastWifiCheck > 5000) {
+    if(WiFi.status() != WL_CONNECTED) connectWiFi();
+    lastWifiCheck = millis();
   }
-  if(!mqtt.connected()) {
-    connectMQTT();
-  }
-
+  
+  if(!mqtt.connected()) connectMQTT();
+  
   mqtt.loop();
-
-  updateSiren();
-
-  digitalWrite(LED_ROUGE, red);
-  digitalWrite(LED_YELLOW, yellow);
-  digitalWrite(LED_VERTE, green);
-
-  unsigned long now = millis();
-  if(now - lastPublishMs >= publishIntervalMs && digitalRead(BOUTON) == LOW) {
-    lastPublishMs = now;
-    ambulanceState = !ambulanceState;
-    publishAmbulance(ambulanceState);
+  handleButton();
+  
+  // Test via Serial Monitor
+  if(Serial.available()) {
+    char cmd = Serial.read();
+    if(cmd == 't' || cmd == 'T') {
+      testMultipleScenarios();
+    }
+    if(cmd == '1') {
+      Serial.println("\nTest personnalisé :");
+      Serial.println("Entrez le nombre de messages :");
+      while(!Serial.available()) delay(5000);
+      uint32_t numMsg = Serial.parseInt();
+      Serial.println("Entrez le délai (ms) :");
+      while(!Serial.available()) delay(5000);
+      uint32_t delayMs = Serial.parseInt();
+      testRateLimit(numMsg, delayMs);
+    }
   }
-
+  
+  delay(10);
 }
-
-
